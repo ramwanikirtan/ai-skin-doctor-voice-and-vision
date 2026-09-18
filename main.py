@@ -20,6 +20,9 @@ from voice_recorder_bot import transcribe_voice
 # Voice Bot
 from voice_bot import speak
 
+# RAG retrieval (knowledge base lookup; ingestion lives in rag/ingest.py)
+from rag.retriever import retrieve
+
 
 def _fmt_timing(label, seconds):
     return f"{label}: {seconds:.1f}s"
@@ -33,6 +36,7 @@ def process_inputs(audio_filepath, image_filepath, video_filepath):
             "Please record or upload your voice question.",
             None,
             "No timing — no audio received.",
+            "",
         )
 
     total_start = time.perf_counter()
@@ -43,14 +47,29 @@ def process_inputs(audio_filepath, image_filepath, video_filepath):
         patient_text = transcribe_voice(audio_filepath)
         t_transcribe = time.perf_counter() - t0
 
-        # STEP 3: this text + user's image/video will be sent to brain of the doctor
+        # STEP 3a: RAG retrieval — find supporting dermatology passages.
+        # Failure here must not break the consultation; fall back to no evidence.
         t0 = time.perf_counter()
-        doctor_response = brain_of_the_doctor(
+        try:
+            evidence = retrieve(patient_text, k=3)
+        except Exception as e:
+            print(f"[rag] retrieval failed, continuing without evidence: {e}")
+            evidence = []
+        t_retrieval = time.perf_counter() - t0
+
+        # STEP 3b: this text + user's image/video + evidence goes to the brain
+        t0 = time.perf_counter()
+        doctor_response, sources = brain_of_the_doctor(
             patient_text=patient_text,
             image_filepath=image_filepath,
             video_filepath=video_filepath,
+            evidence=evidence,
         )
         t_brain = time.perf_counter() - t0
+        sources_text = (
+            "Knowledge sources: " + ", ".join(sources)
+            if sources else "No specific sources retrieved."
+        )
 
         # STEP 4: brain of the doctor responded in text (doctor_response)
 
@@ -62,6 +81,7 @@ def process_inputs(audio_filepath, image_filepath, video_filepath):
         total = time.perf_counter() - total_start
         timing_text = (
             f"{_fmt_timing('Transcription', t_transcribe)} | "
+            f"{_fmt_timing('Retrieval', t_retrieval)} | "
             f"{_fmt_timing('Brain', t_brain)} | "
             f"{_fmt_timing('TTS', t_tts)} | "
             f"{_fmt_timing('Total', total)}"
@@ -71,12 +91,13 @@ def process_inputs(audio_filepath, image_filepath, video_filepath):
         # STEP 6: play audio for the patient.
         # No play_audio() / os.startfile call needed — returning the filepath
         # in the gr.Audio output makes Gradio play it in the browser.
-        return patient_text, doctor_response, doctor_response_audio_filepath, timing_text
+        # Sources stay in the UI only — never sent to TTS.
+        return patient_text, doctor_response, doctor_response_audio_filepath, timing_text, sources_text
 
     except FileNotFoundError as e:
-        return "Audio file error.", str(e), None, "No timing — file error."
+        return "Audio file error.", str(e), None, "No timing — file error.", ""
     except ValueError as e:
-        return "Input error.", str(e), None, "No timing — input error."
+        return "Input error.", str(e), None, "No timing — input error.", ""
     except Exception as e:
         total = time.perf_counter() - total_start
         return (
@@ -84,10 +105,11 @@ def process_inputs(audio_filepath, image_filepath, video_filepath):
             f"Something went wrong: {e}",
             None,
             f"Failed after {total:.1f}s.",
+            "",
         )
 
 
-def _build_summary_file(speech_text, guidance_text, timing_text):
+def _build_summary_file(speech_text, guidance_text, timing_text, sources_text):
     """Write a downloadable consultation summary, return its path."""
     import tempfile
 
@@ -96,6 +118,7 @@ def _build_summary_file(speech_text, guidance_text, timing_text):
         "==========================================\n\n"
         f"Patient speech (transcribed):\n{speech_text or '-'}\n\n"
         f"Doctor's guidance:\n{guidance_text or '-'}\n\n"
+        f"Knowledge sources:\n{sources_text or '-'}\n\n"
         f"Pipeline timing:\n{timing_text or '-'}\n\n"
         "Medical Notice: AI guidance is not a medical diagnosis. "
         "Consult a licensed doctor for severe, sudden, or worsening symptoms.\n"
@@ -266,34 +289,31 @@ with gr.Blocks(title="AI Skin Specialist — Dermatological Assessment Workspace
                     autoplay=True,
                     elem_classes=["fit-media"],
                 )
-                timing_out = gr.Textbox(
-                    label="Pipeline Timing (transcription | brain | TTS | total)",
-                    lines=1,
-                    elem_classes=["clinical-timing"],
-                )
+                sources_out = gr.State(value="")
+                timing_out = gr.State(value="")
                 with gr.Row():
                     download_btn = gr.DownloadButton("⬇ Download Summary", variant="secondary", size="sm")
                     forward_btn = gr.Button("➤ Forward to Doctor", variant="primary", size="sm")
 
         gr.HTML(FOOTER_HTML)
 
-    # Wire pipeline: Analyze → 4 outputs
+    # Wire pipeline: Analyze → 5 outputs
     analyze_btn.click(
         fn=process_inputs,
         inputs=[audio_in, image_in, video_in],
-        outputs=[speech_out, guidance_out, voice_out, timing_out],
+        outputs=[speech_out, guidance_out, voice_out, timing_out, sources_out],
     )
     # Download summary from latest outputs
     download_btn.click(
         fn=_build_summary_file,
-        inputs=[speech_out, guidance_out, timing_out],
+        inputs=[speech_out, guidance_out, timing_out, sources_out],
         outputs=[download_btn],
     )
     # Clear everything
     clear_btn.click(
-        fn=lambda: (None, None, None, "", "", None, ""),
+        fn=lambda: (None, None, None, "", "", None, "", ""),
         inputs=None,
-        outputs=[audio_in, image_in, video_in, speech_out, guidance_out, voice_out, timing_out],
+        outputs=[audio_in, image_in, video_in, speech_out, guidance_out, voice_out, timing_out, sources_out],
     )
     forward_btn.click(
         fn=lambda: gr.Info("Summary prepared — share the downloaded file with your doctor."),

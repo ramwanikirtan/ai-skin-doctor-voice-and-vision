@@ -15,27 +15,110 @@ client = OpenAI(
 )
 
 
-# Voice-first doctor: short, conversational, TTS-safe, never over-diagnoses.
-# Safety-first: one photo alone is NEVER enough for a diagnosis.
+# Voice-first doctor: uncertainty-aware, evidence-driven, never templated.
+# The reply adapts to the case: what was asked, what is visible, what the
+# references support, and what is genuinely still needed. Safety without a
+# fixed script: no mandatory video request, no identical disclaimer each time.
 SYSTEM_PROMPT = (
     "You are an AI skin-analysis assistant speaking to a patient through voice. "
-    "Reply in plain conversational English with 2 to 3 short sentences only. "
-    "No Markdown. No numbered lists. No bullet points. No bold. No asterisks. "
-    "No hash symbols. No long disclaimer. "
-    "Never claim or imply a definitive diagnosis, especially from a single photo alone. "
-    "A single photo alone is never enough to diagnose. Do not hallucinate details "
-    "you cannot clearly see. Use cautious words like could be or I can see. "
-    "If ONLY one photo was provided and no video: describe briefly what you observe, "
-    "say clearly that one photo is not enough to assess reliably, "
-    "and ask for a short video plus whether it itches, hurts, how long it has been there, "
-    "and whether it is spreading. End by advising to consult a dermatologist. "
-    "If a video or clearer evidence plus symptoms were provided: you may mention one or two "
-    "possibilities with could be, keep the uncertainty such as I cannot confirm this without an in-person exam, "
-    "give one safe next step, and advise to consult a dermatologist. "
-    "If no image or video was provided: ask for a clear close-up photo or a short video "
-    "plus the same symptom details, and advise to consult a dermatologist. "
-    "Every reply must naturally advise consulting a dermatologist in the final sentence."
+    "Reply in plain conversational English with no Markdown, no lists, no bullet points, "
+    "no bold, no asterisks, no hash symbols — the reply will be read aloud. "
+    "Base your answer on three things together: what the patient asked, what is actually "
+    "visible in any photo or video frames, and the reference passages provided below. "
+    "Describe only what you can actually see; never invent visual details. "
+    "Never claim a definitive diagnosis from an image. Where uncertainty fits, use cautious "
+    "language such as could be consistent with, one possibility is, the appearance may fit, "
+    "or this cannot be confirmed from an image alone. "
+    "When a reference passage is genuinely relevant, use it: connect what you observe to the "
+    "passage's general medical information, for example According to the American Academy "
+    "of Dermatology, itching and redness are common features of eczema. "
+    "Ignore passages that are irrelevant to this case — never force them into the answer. "
+    "Never present a retrieved passage as proof of this patient's condition, and never invent "
+    "sources or citations beyond the passages given. "
+    "Clearly keep apart what you observe, what it could be and why, what the references add, "
+    "and what remains uncertain. "
+    "Decide yourself what is needed next. If the image and question already allow a useful "
+    "explanation, give it and do not demand a video. Ask for a clearer photo, a short video, "
+    "or symptom details such as onset, itch or pain, spreading, or new products touching the "
+    "area only when that information would genuinely improve the assessment. "
+    "Recommend prompt in-person care when warning signs are present, such as rapidly spreading "
+    "redness, swelling, pus or discharge, red streaking, severe pain, or fever with a rash. "
+    "Otherwise word any care-seeking note naturally for the case instead of repeating one fixed "
+    "disclaimer. "
+    "Let length and structure follow the case: a simple question gets a concise answer, while a "
+    "complex image earns a fuller explanation covering what you see, what it could be and why, "
+    "what the references add, what may help, and what further information would help. "
+    "End your reply with one machine-readable line naming the sources you actually relied on: "
+    "USED_SOURCES: <comma-separated source numbers, or the word none>. "
+    "That line is removed before the patient hears anything, so always include it."
 )
+
+
+def _build_evidence_block(evidence):
+    """Format retrieved passages as structured, citable sources for the LLM."""
+    if not evidence:
+        return ""
+    parts = []
+    for i, chunk in enumerate(evidence, start=1):
+        parts.append(
+            f"SOURCE {i}\n"
+            f"Organization: {chunk.get('source_org', 'unknown source')}\n"
+            f"Title: {chunk.get('title', '')}\n"
+            f"Section: {chunk.get('section', '')}\n"
+            f"Content: {chunk.get('text', '')}"
+        )
+    return (
+        "Reference passages — use the ones relevant to this case, ignore the rest:\n\n"
+        + "\n\n".join(parts)
+    )
+
+
+def _source_names(evidence):
+    """Deduped organization names for UI display (never sent to TTS)."""
+    names = []
+    for chunk in evidence or []:
+        org = (chunk.get("source_org") or "").strip()
+        if org and org not in names:
+            names.append(org)
+    return names
+
+
+def _used_sources(reply_text, evidence):
+    """Parse the model's USED_SOURCES trailer into 'Org — Title' refs.
+
+    Falls back to all retrieved orgs if the trailer is missing/unparseable,
+    so the UI never ends up with less information than before.
+    Returns (cleaned_reply_text, source_refs).
+    """
+    refs, cleaned = _source_names(evidence), reply_text
+    if not reply_text:
+        return cleaned, refs
+    matches = re.findall(
+        r"USED_SOURCES\s*:\s*([^\n\r]+)",
+        reply_text, flags=re.IGNORECASE,
+    )
+    if not matches:
+        return cleaned, refs
+    cleaned = re.sub(
+        r"[ \t]*USED_SOURCES\s*:\s*[^\n\r]*",
+        "", reply_text, flags=re.IGNORECASE,
+    ).strip()
+    trailer = matches[-1].strip().lower()
+    if trailer in ("none", "n/a", "-"):
+        return cleaned, []
+    used = []
+    for token in re.split(r"[,\s;]+", trailer):
+        if token.isdigit():
+            idx = int(token) - 1
+            if evidence is not None and 0 <= idx < len(evidence):
+                chunk = evidence[idx]
+                org = (chunk.get("source_org") or "unknown source").strip()
+                title = (chunk.get("title") or chunk.get("section") or "").strip()
+                ref = f"{org} — {title}" if title else org
+                if ref not in used:
+                    used.append(ref)
+    # If the model wrote numbers that match nothing, keep the safe fallback.
+    return cleaned, (used or refs)
 
 
 def _clean_for_tts(text):
@@ -53,7 +136,12 @@ def _clean_for_tts(text):
     return text
 
 
-def brain_of_the_doctor(patient_text, image_filepath=None, video_filepath=None):
+def brain_of_the_doctor(patient_text, image_filepath=None, video_filepath=None, evidence=None):
+    """Run vision + grounded generation. Returns (response_text, source_org_names).
+
+    evidence: list of retrieved chunk dicts from rag.retriever.retrieve()
+    (may be empty/None — the brain still works, with an explicit no-evidence note).
+    """
 
     if not patient_text or not patient_text.strip():
         raise ValueError("patient_text is empty — transcription failed or no audio provided.")
@@ -63,28 +151,37 @@ def brain_of_the_doctor(patient_text, image_filepath=None, video_filepath=None):
 
     if has_image and not has_video:
         evidence_note = (
-            "Evidence: a single photo only, no video. "
-            "Follow the single-photo rule: do not diagnose, ask for a short video "
-            "and symptom details, and advise consulting a dermatologist."
+            "What was provided: one photo plus the patient's words, no video. "
+            "Judge the photo on its own merits — if it clearly shows the area, "
+            "give a useful description and explanation without demanding a video; "
+            "only ask for a video, a clearer photo, or symptom details if that "
+            "information would genuinely change the assessment."
         )
     elif has_video:
         evidence_note = (
-            "Evidence: video frames provided (possibly with a photo). "
-            "You may discuss possibilities cautiously with uncertainty, "
-            "and still advise consulting a dermatologist."
+            "What was provided: video frames (possibly with a photo) plus the "
+            "patient's words. Use the frames together with the words, staying "
+            "uncertain where the images cannot settle the matter."
         )
     else:
         evidence_note = (
-            "Evidence: no image or video provided, only the patient's words. "
-            "Ask for a clear photo or short video plus symptom details, "
-            "and advise consulting a dermatologist."
+            "What was provided: only the patient's words, no image or video. "
+            "Answer what you can from the words and references; ask for a photo "
+            "or symptom details only if they would genuinely help."
         )
 
     # Creating content
+    user_text = patient_text.strip() + f"\n\n[{evidence_note}]"
+    evidence_block = _build_evidence_block(evidence)
+    if evidence_block:
+        user_text += f"\n\n{evidence_block}"
+    else:
+        user_text += "\n\n[No reference passages retrieved — rely on careful observation only.]"
+
     content = [
         {
             "type": "text",
-            "text": f"{patient_text.strip()}\n\n[{evidence_note}]"
+            "text": user_text
         }
     ]
 
@@ -239,17 +336,22 @@ def brain_of_the_doctor(patient_text, image_filepath=None, video_filepath=None):
     ]
 
 
-    # Sending request to OpenAI (short output = faster + TTS-friendly + less hallucination)
+    # Sending request to OpenAI (length follows the case: concise when simple,
+    # fuller when the image/complaint needs it; still TTS-friendly speech)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        max_tokens=150,
-        temperature=0.2,
+        max_tokens=400,
+        temperature=0.5,
         messages=messages
     )
 
 
-    # Return doctor's response, cleaned for TTS
-    return _clean_for_tts(response.choices[0].message.content)
+    raw_reply = response.choices[0].message.content
+    # Strip the machine-readable trailer (never spoken), attribute real sources.
+    reply_no_trailer, source_refs = _used_sources(raw_reply, evidence)
+
+    # Return (doctor's response cleaned for TTS, source refs for UI display)
+    return _clean_for_tts(reply_no_trailer), source_refs
 
 
 # --------------------------------------------------

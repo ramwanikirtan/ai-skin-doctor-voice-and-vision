@@ -8,12 +8,19 @@ from elevenlabs.types import VoiceSettings
 
 load_dotenv()
 
+# Cached singleton: reused across requests (no behavior change).
+_client = None
+
 
 def _get_client():
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not api_key:
-        raise ValueError("ELEVENLABS_API_KEY is not set")
-    return ElevenLabs(api_key=api_key)
+    """Return a shared ElevenLabs client instead of creating one per request."""
+    global _client
+    if _client is None:
+        api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            raise ValueError("ELEVENLABS_API_KEY is not set")
+        _client = ElevenLabs(api_key=api_key)
+    return _client
 
 
 def speak(text):
@@ -27,6 +34,8 @@ def speak(text):
         text=text,
         voice_id="SAz9YHcvj6GT2YYXdXww",
         model_id="eleven_multilingual_v2",
+        output_format="mp3_44100_128",
+        optimize_streaming_latency=4,
         voice_settings=VoiceSettings(
             stability=0.5,
             speed=0.9
